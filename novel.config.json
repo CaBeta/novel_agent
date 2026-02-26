@@ -1,0 +1,12 @@
+{
+  "llm": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "temperature": 0.8,
+    "maxTokens": 4096
+  },
+  "output": {
+    "dir": "./output",
+    "filenamePattern": "chapter_{index}"
+  }
+}
