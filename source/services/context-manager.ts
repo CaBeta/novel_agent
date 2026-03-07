@@ -1,54 +1,84 @@
-import type { Character } from "../types/index.js";
-import type { NovelProject, ProjectChapter } from "../types/project.js";
+import type { ProjectMemoryData } from "../types/memory.js";
+import { MemoryRetriever } from "./memory/memory-retriever.js";
 
-const MAX_CONTEXT_LENGTH = 3000;
+const MAX_CONTEXT_LENGTH = 3600;
 
 export class ContextManager {
-  private chapters: ProjectChapter[] = [];
-  private characters: Character[] = [];
+  private memory: ProjectMemoryData = {
+    characters: [],
+    worldbook: [],
+    timeline: [],
+    foreshadowing: [],
+    summaries: []
+  };
   private outline = "";
+  private readonly retriever = new MemoryRetriever();
 
-  loadProject(project: Pick<NovelProject, "outline" | "characters" | "chapters">): void {
+  loadProject(project: { outline: string; memory: ProjectMemoryData }): void {
     this.outline = project.outline;
-    this.characters = [...project.characters];
-    this.chapters = [...project.chapters];
+    this.memory = {
+      characters: [...project.memory.characters],
+      worldbook: [...project.memory.worldbook],
+      timeline: [...project.memory.timeline],
+      foreshadowing: [...project.memory.foreshadowing],
+      summaries: [...project.memory.summaries]
+    };
   }
 
-  setOutline(outline: string): void {
-    this.outline = outline;
-  }
-
-  addCharacter(character: Character): void {
-    this.characters.push(character);
-  }
-
-  addChapter(chapter: ProjectChapter): void {
-    this.chapters.push(chapter);
-  }
-
-  buildContext(): string {
+  buildContext(topic: string): string {
+    const retrieval = this.retriever.retrieveForTopic(this.memory, topic);
     const parts: string[] = [];
 
     if (this.outline) {
       parts.push(`【大纲】\n${this.outline}`);
     }
 
-    if (this.characters.length > 0) {
-      const characterDescriptions = this.characters
-        .map((character) => `- ${character.name}: ${character.description}`)
-        .join("\n");
-      parts.push(`【主要角色】\n${characterDescriptions}`);
-    }
-
-    if (this.chapters.length > 0) {
-      const recentSummaries = this.chapters
-        .slice(-3)
+    if (retrieval.characters.length > 0) {
+      const characterDescriptions = retrieval.characters
         .map(
-          (chapter) =>
-            `第${chapter.index}章「${chapter.title}」: ${chapter.summary}`
+          (character) =>
+            `- ${character.name}: ${character.description}；当前状态：${character.currentStatus}`
         )
         .join("\n");
-      parts.push(`【近期章节摘要】\n${recentSummaries}`);
+      parts.push(`【相关角色】\n${characterDescriptions}`);
+    }
+
+    if (retrieval.worldbook.length > 0) {
+      const worldbookEntries = retrieval.worldbook
+        .map((entry) => `- ${entry.title}: ${entry.content}`)
+        .join("\n");
+      parts.push(`【相关设定】\n${worldbookEntries}`);
+    }
+
+    if (retrieval.summaries.length > 0) {
+      const recentSummaries = retrieval.summaries
+        .map(
+          (summary) =>
+            `第${summary.chapterIndex}章「${summary.title}」: ${summary.summary}`
+        )
+        .join("\n");
+      parts.push(`【相关章节摘要】\n${recentSummaries}`);
+    }
+
+    if (retrieval.timeline.length > 0) {
+      const timelineEntries = retrieval.timeline
+        .map(
+          (event) =>
+            `第${event.chapterIndex}章: ${event.summary}${
+              event.participants.length > 0
+                ? `（涉及：${event.participants.join("、")}）`
+                : ""
+            }`
+        )
+        .join("\n");
+      parts.push(`【关键时间线】\n${timelineEntries}`);
+    }
+
+    if (retrieval.foreshadowing.length > 0) {
+      const foreshadowingEntries = retrieval.foreshadowing
+        .map((item) => `- 第${item.introducedInChapter}章埋下：${item.clue}`)
+        .join("\n");
+      parts.push(`【未回收伏笔】\n${foreshadowingEntries}`);
     }
 
     const context = parts.join("\n\n");

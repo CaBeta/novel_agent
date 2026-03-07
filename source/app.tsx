@@ -9,6 +9,8 @@ import { useNovelContext } from "./hooks/useNovelContext.js";
 import { useStreamWriter } from "./hooks/useStreamWriter.js";
 import { createLLMProvider } from "./services/llm/index.js";
 import type { LLMProvider } from "./services/llm/index.js";
+import { MemoryManager } from "./services/memory/memory-manager.js";
+import { MemoryWriter, summarizeChapterContent } from "./services/memory/memory-writer.js";
 import { FileManager } from "./services/file-manager.js";
 import { createProjectManager } from "./services/project/project-manager.js";
 import { resolveProjectPaths } from "./services/project/project-paths.js";
@@ -86,10 +88,6 @@ function initializeRuntime(): RuntimeState {
   }
 }
 
-function summarizeChapter(content: string): string {
-  return content.replace(/\s+/g, " ").trim().slice(0, 200);
-}
-
 export default function App() {
   const [runtime] = useState<RuntimeState>(initializeRuntime);
   const [step, setStep] = useState<AppStep>("loading");
@@ -102,6 +100,8 @@ export default function App() {
     null
   );
   const [projectPaths, setProjectPaths] = useState<ProjectPaths | null>(null);
+  const [memoryManager, setMemoryManager] = useState<MemoryManager | null>(null);
+  const [memoryWriter, setMemoryWriter] = useState<MemoryWriter | null>(null);
   const [chapterIndex, setChapterIndex] = useState(1);
   const [savedPath, setSavedPath] = useState("");
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
@@ -123,13 +123,17 @@ export default function App() {
         nextPaths.chaptersDir,
         services.config.output.filenamePattern
       );
+      const nextMemoryManager = new MemoryManager(nextPaths);
+      const memory = await nextMemoryManager.initialize(project);
       const nextChapterIndex = await fileManager.getNextChapterIndex();
 
       setCurrentProject(project);
       setProjectPaths(nextPaths);
+      setMemoryManager(nextMemoryManager);
+      setMemoryWriter(new MemoryWriter(nextMemoryManager));
       setChapterIndex(nextChapterIndex);
       setRuntimeError(null);
-      hydrateProject(project);
+      hydrateProject({ outline: project.outline, memory });
     },
     [hydrateProject, runtime]
   );
@@ -243,7 +247,7 @@ export default function App() {
     async (topic: string) => {
       const services = runtime.services;
 
-      if (!services || !currentProject || !projectPaths) {
+      if (!services || !currentProject || !projectPaths || !memoryWriter || !memoryManager) {
         setRuntimeError("当前项目未初始化完成");
         setStep("error");
         return;
@@ -252,7 +256,7 @@ export default function App() {
       setRuntimeError(null);
       setStep("writing");
 
-      const context = buildContext();
+      const context = buildContext(topic);
       const messages = buildWriterMessages(topic, context);
       const result = await writer.start(messages);
 
@@ -278,7 +282,7 @@ export default function App() {
         const chapter: ProjectChapter = {
           index: chapterIndex,
           title: topic,
-          summary: summarizeChapter(result.content),
+          summary: summarizeChapterContent(result.content),
           filepath,
           charCount: Array.from(result.content).length,
           createdAt: new Date().toISOString()
@@ -287,17 +291,36 @@ export default function App() {
           currentProject,
           chapter
         );
+        const memoryUpdate = await memoryWriter.recordChapter({
+          chapterIndex,
+          title: topic,
+          content: result.content,
+          createdAt: chapter.createdAt
+        });
 
         setSavedPath(filepath);
         setCurrentProject(updatedProject);
-        hydrateProject(updatedProject);
+        hydrateProject({
+          outline: updatedProject.outline,
+          memory: memoryUpdate.memory
+        });
         setStep("done");
       } catch (error) {
         setRuntimeError(getErrorMessage(error, "保存章节失败"));
         setStep("error");
       }
     },
-    [buildContext, chapterIndex, currentProject, hydrateProject, projectPaths, runtime, writer]
+    [
+      buildContext,
+      chapterIndex,
+      currentProject,
+      hydrateProject,
+      memoryManager,
+      memoryWriter,
+      projectPaths,
+      runtime,
+      writer
+    ]
   );
 
   const handleAbort = useCallback(() => {
