@@ -1,14 +1,26 @@
-import { useMemo } from "react";
-import type { Chapter, Character } from "../types/index.js";
+import { useCallback, useMemo } from "react";
+import type { Character } from "../types/index.js";
+import type { NovelProject, ProjectChapter } from "../types/project.js";
 import { ContextManager } from "../services/context-manager.js";
 
 export function useNovelContext() {
   const manager = useMemo(() => new ContextManager(), []);
 
-  const setOutline = (outline: string) => manager.setOutline(outline);
-  const addCharacter = (character: Character) => manager.addCharacter(character);
-  const addChapter = (chapter: Chapter) => manager.addChapter(chapter);
-  const buildContext = () => manager.buildContext();
+  const hydrateProject = useCallback((
+    project: Pick<NovelProject, "outline" | "characters" | "chapters">
+  ) => manager.loadProject(project), [manager]);
+  const setOutline = useCallback((outline: string) => manager.setOutline(outline), [
+    manager
+  ]);
+  const addCharacter = useCallback(
+    (character: Character) => manager.addCharacter(character),
+    [manager]
+  );
+  const addChapter = useCallback(
+    (chapter: ProjectChapter) => manager.addChapter(chapter),
+    [manager]
+  );
+  const buildContext = useCallback(() => manager.buildContext(), [manager]);
 
-  return { setOutline, addCharacter, addChapter, buildContext };
+  return { hydrateProject, setOutline, addCharacter, addChapter, buildContext };
 }

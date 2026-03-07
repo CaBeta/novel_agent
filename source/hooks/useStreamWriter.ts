@@ -9,6 +9,12 @@ interface StreamWriterState {
   charCount: number;
 }
 
+interface StreamWriterResult {
+  content: string | null;
+  error: string | null;
+  aborted: boolean;
+}
+
 export function useStreamWriter(llm: LLMProvider) {
   const [state, setState] = useState<StreamWriterState>({
     content: "",
@@ -19,7 +25,7 @@ export function useStreamWriter(llm: LLMProvider) {
   const abortRef = useRef<AbortController | null>(null);
 
   const start = useCallback(
-    async (messages: Message[]) => {
+    async (messages: Message[]): Promise<StreamWriterResult> => {
       abortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
@@ -44,17 +50,23 @@ export function useStreamWriter(llm: LLMProvider) {
         if (!controller.signal.aborted) {
           setState((prev) => ({ ...prev, isWriting: false }));
         }
-        return fullText;
+        return {
+          content: controller.signal.aborted ? null : fullText,
+          error: null,
+          aborted: controller.signal.aborted
+        };
       } catch (error) {
-        if (!controller.signal.aborted) {
-          const message = error instanceof Error ? error.message : "未知错误";
-          setState((prev) => ({
-            ...prev,
-            isWriting: false,
-            error: message
-          }));
+        if (controller.signal.aborted) {
+          return { content: null, error: null, aborted: true };
         }
-        return null;
+
+        const message = error instanceof Error ? error.message : "未知错误";
+        setState((prev) => ({
+          ...prev,
+          isWriting: false,
+          error: message
+        }));
+        return { content: null, error: message, aborted: false };
       }
     },
     [llm]

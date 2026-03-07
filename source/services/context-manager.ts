@@ -1,11 +1,18 @@
-import type { Chapter, Character } from "../types/index.js";
+import type { Character } from "../types/index.js";
+import type { NovelProject, ProjectChapter } from "../types/project.js";
 
 const MAX_CONTEXT_LENGTH = 3000;
 
 export class ContextManager {
-  private chapters: Chapter[] = [];
+  private chapters: ProjectChapter[] = [];
   private characters: Character[] = [];
   private outline = "";
+
+  loadProject(project: Pick<NovelProject, "outline" | "characters" | "chapters">): void {
+    this.outline = project.outline;
+    this.characters = [...project.characters];
+    this.chapters = [...project.chapters];
+  }
 
   setOutline(outline: string): void {
     this.outline = outline;
@@ -15,7 +22,7 @@ export class ContextManager {
     this.characters.push(character);
   }
 
-  addChapter(chapter: Chapter): void {
+  addChapter(chapter: ProjectChapter): void {
     this.chapters.push(chapter);
   }
 
