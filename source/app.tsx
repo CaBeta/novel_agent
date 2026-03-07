@@ -100,7 +100,6 @@ export default function App() {
     null
   );
   const [projectPaths, setProjectPaths] = useState<ProjectPaths | null>(null);
-  const [memoryManager, setMemoryManager] = useState<MemoryManager | null>(null);
   const [memoryWriter, setMemoryWriter] = useState<MemoryWriter | null>(null);
   const [chapterIndex, setChapterIndex] = useState(1);
   const [savedPath, setSavedPath] = useState("");
@@ -129,7 +128,6 @@ export default function App() {
 
       setCurrentProject(project);
       setProjectPaths(nextPaths);
-      setMemoryManager(nextMemoryManager);
       setMemoryWriter(new MemoryWriter(nextMemoryManager));
       setChapterIndex(nextChapterIndex);
       setRuntimeError(null);
@@ -247,7 +245,7 @@ export default function App() {
     async (topic: string) => {
       const services = runtime.services;
 
-      if (!services || !currentProject || !projectPaths || !memoryWriter || !memoryManager) {
+      if (!services || !currentProject || !projectPaths || !memoryWriter) {
         setRuntimeError("当前项目未初始化完成");
         setStep("error");
         return;
@@ -295,7 +293,8 @@ export default function App() {
           chapterIndex,
           title: topic,
           content: result.content,
-          createdAt: chapter.createdAt
+          createdAt: chapter.createdAt,
+          artifactsDir: projectPaths.artifactsDir
         });
 
         setSavedPath(filepath);
@@ -315,7 +314,6 @@ export default function App() {
       chapterIndex,
       currentProject,
       hydrateProject,
-      memoryManager,
       memoryWriter,
       projectPaths,
       runtime,

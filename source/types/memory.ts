@@ -7,6 +7,10 @@ export interface CharacterMemory {
   secrets: string[];
   currentStatus: string;
   aliases: string[];
+  latestSummary: string;
+  lastSeenChapter: number | null;
+  recentEvents: string[];
+  sourceChapterIndices: number[];
 }
 
 export interface WorldbookEntry {
@@ -14,6 +18,8 @@ export interface WorldbookEntry {
   title: string;
   content: string;
   tags: string[];
+  sourceChapterIndices: number[];
+  lastUpdatedAt: string;
 }
 
 export interface TimelineEvent {
@@ -23,6 +29,7 @@ export interface TimelineEvent {
   summary: string;
   participants: string[];
   consequences: string[];
+  keywords: string[];
   occurredAt: string;
 }
 
@@ -33,6 +40,7 @@ export interface ForeshadowingItem {
   introducedInChapter: number;
   payoffChapter: number | null;
   notes: string;
+  relatedCharacters: string[];
 }
 
 export interface ChapterSummaryMemory {
@@ -65,4 +73,25 @@ export interface ChapterMemoryUpdateResult {
   summary: ChapterSummaryMemory;
   timelineEvent: TimelineEvent;
   mentionedCharacterIds: string[];
+  report: MemoryUpdateReport;
+}
+
+export interface MemoryUpdateReport {
+  chapterIndex: number;
+  title: string;
+  createdAt: string;
+  summary: ChapterSummaryMemory;
+  timelineEvent: TimelineEvent;
+  matchedCharacterIds: string[];
+  characterChanges: {
+    updatedIds: string[];
+  };
+  worldbookChanges: {
+    addedIds: string[];
+    updatedIds: string[];
+  };
+  foreshadowingChanges: {
+    addedIds: string[];
+    resolvedIds: string[];
+  };
 }

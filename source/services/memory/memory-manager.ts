@@ -66,7 +66,11 @@ function toCharacterMemory(character: Character): CharacterMemory {
     goals: [],
     secrets: [],
     currentStatus: character.description,
-    aliases: []
+    aliases: [],
+    latestSummary: "",
+    lastSeenChapter: null,
+    recentEvents: [],
+    sourceChapterIndices: []
   };
 }
 
@@ -88,6 +92,7 @@ function toTimelineEvent(chapter: ProjectChapter): TimelineEvent {
     summary: chapter.summary,
     participants: [],
     consequences: [chapter.summary],
+    keywords: [chapter.title].filter(Boolean),
     occurredAt: chapter.createdAt
   };
 }
