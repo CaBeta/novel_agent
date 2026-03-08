@@ -1,5 +1,6 @@
 import type {
   ChapterSummaryMemory,
+  CharacterRelationMemory,
   ForeshadowingItem,
   MemoryRetrievalResult,
   ProjectMemoryData,
@@ -104,6 +105,26 @@ export class MemoryRetriever {
       maxCharacters
     );
 
+    const characterIds = new Set(characters.map((item) => item.id));
+    const relations = takeMatchedOrFallback(
+      sortByScore<CharacterRelationMemory>(
+        memory.relations.filter(
+          (relation) =>
+            characterIds.has(relation.fromCharacterId) ||
+            characterIds.has(relation.toCharacterId)
+        ),
+        (relation) =>
+          scoreTexts(tokens, [
+            relation.fromCharacterName,
+            relation.toCharacterName,
+            relation.currentStatus,
+            relation.latestSummary
+          ]),
+        (relation) => relation.lastUpdatedChapter
+      ),
+      4
+    ).sort((left, right) => left.lastUpdatedChapter - right.lastUpdatedChapter);
+
     const worldbook = takeMatchedOrFallback(
       sortByScore<WorldbookEntry>(
         memory.worldbook,
@@ -148,6 +169,7 @@ export class MemoryRetriever {
 
     return {
       characters,
+      relations,
       worldbook,
       timeline,
       foreshadowing,

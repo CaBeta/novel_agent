@@ -11,6 +11,23 @@ export class OpenAIProvider implements LLMProvider {
     this.config = config;
   }
 
+  async generateText(
+    messages: Message[],
+    signal?: AbortSignal
+  ): Promise<string> {
+    const completion = await this.client.chat.completions.create(
+      {
+        model: this.config.model,
+        temperature: Math.min(this.config.temperature, 0.4),
+        max_tokens: this.config.maxTokens,
+        messages
+      },
+      { signal }
+    );
+
+    return completion.choices[0]?.message?.content ?? "";
+  }
+
   async *streamGenerate(
     messages: Message[],
     signal?: AbortSignal

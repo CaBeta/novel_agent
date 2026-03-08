@@ -6,6 +6,7 @@ const MAX_CONTEXT_LENGTH = 3600;
 export class ContextManager {
   private memory: ProjectMemoryData = {
     characters: [],
+    relations: [],
     worldbook: [],
     timeline: [],
     foreshadowing: [],
@@ -18,6 +19,7 @@ export class ContextManager {
     this.outline = project.outline;
     this.memory = {
       characters: [...project.memory.characters],
+      relations: [...project.memory.relations],
       worldbook: [...project.memory.worldbook],
       timeline: [...project.memory.timeline],
       foreshadowing: [...project.memory.foreshadowing],
@@ -41,6 +43,16 @@ export class ContextManager {
         )
         .join("\n");
       parts.push(`【相关角色】\n${characterDescriptions}`);
+    }
+
+    if (retrieval.relations.length > 0) {
+      const relationshipDescriptions = retrieval.relations
+        .map(
+          (relation) =>
+            `- ${relation.fromCharacterName} / ${relation.toCharacterName}: ${relation.currentStatus}`
+        )
+        .join("\n");
+      parts.push(`【角色关系】\n${relationshipDescriptions}`);
     }
 
     if (retrieval.worldbook.length > 0) {

@@ -4,6 +4,7 @@ import type { Character } from "../../types/index.js";
 import type {
   ChapterSummaryMemory,
   CharacterMemory,
+  CharacterRelationMemory,
   ProjectMemoryData,
   TimelineEvent
 } from "../../types/memory.js";
@@ -11,6 +12,7 @@ import type { NovelProject, ProjectChapter, ProjectPaths } from "../../types/pro
 
 const MEMORY_FILES = {
   characters: "characters.json",
+  relations: "relations.json",
   worldbook: "worldbook.json",
   timeline: "timeline.json",
   foreshadowing: "foreshadowing.json",
@@ -20,6 +22,7 @@ const MEMORY_FILES = {
 function buildMemoryFilepaths(memoryDir: string) {
   return {
     characters: path.join(memoryDir, MEMORY_FILES.characters),
+    relations: path.join(memoryDir, MEMORY_FILES.relations),
     worldbook: path.join(memoryDir, MEMORY_FILES.worldbook),
     timeline: path.join(memoryDir, MEMORY_FILES.timeline),
     foreshadowing: path.join(memoryDir, MEMORY_FILES.foreshadowing),
@@ -50,6 +53,7 @@ function buildId(prefix: string, raw: string): string {
 function createEmptyMemory(): ProjectMemoryData {
   return {
     characters: [],
+    relations: [],
     worldbook: [],
     timeline: [],
     foreshadowing: [],
@@ -136,6 +140,7 @@ export class MemoryManager {
         existing.characters.length > 0
           ? existing.characters
           : project.characters.map(toCharacterMemory),
+      relations: existing.relations,
       worldbook: existing.worldbook,
       timeline:
         existing.timeline.length > 0
@@ -155,9 +160,10 @@ export class MemoryManager {
   async load(): Promise<ProjectMemoryData> {
     await this.ensureMemoryDir();
 
-    const [characters, worldbook, timeline, foreshadowing, summaries] =
+    const [characters, relations, worldbook, timeline, foreshadowing, summaries] =
       await Promise.all([
         readJsonFile<CharacterMemory[]>(this.files.characters),
+        readJsonFile<CharacterRelationMemory[]>(this.files.relations),
         readJsonFile<ProjectMemoryData["worldbook"]>(this.files.worldbook),
         readJsonFile<TimelineEvent[]>(this.files.timeline),
         readJsonFile<ProjectMemoryData["foreshadowing"]>(this.files.foreshadowing),
@@ -167,6 +173,7 @@ export class MemoryManager {
     return {
       ...createEmptyMemory(),
       ...(characters ? { characters } : {}),
+      ...(relations ? { relations } : {}),
       ...(worldbook ? { worldbook } : {}),
       ...(timeline ? { timeline } : {}),
       ...(foreshadowing ? { foreshadowing } : {}),
@@ -179,6 +186,7 @@ export class MemoryManager {
 
     await Promise.all([
       writeJsonFile(this.files.characters, memory.characters),
+      writeJsonFile(this.files.relations, memory.relations),
       writeJsonFile(this.files.worldbook, memory.worldbook),
       writeJsonFile(this.files.timeline, memory.timeline),
       writeJsonFile(this.files.foreshadowing, memory.foreshadowing),

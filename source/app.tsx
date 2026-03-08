@@ -9,6 +9,7 @@ import { useNovelContext } from "./hooks/useNovelContext.js";
 import { useStreamWriter } from "./hooks/useStreamWriter.js";
 import { createLLMProvider } from "./services/llm/index.js";
 import type { LLMProvider } from "./services/llm/index.js";
+import { MemoryExtractor } from "./services/memory/memory-extractor.js";
 import { MemoryManager } from "./services/memory/memory-manager.js";
 import { MemoryWriter, summarizeChapterContent } from "./services/memory/memory-writer.js";
 import { FileManager } from "./services/file-manager.js";
@@ -36,6 +37,9 @@ interface RuntimeState {
 }
 
 const FALLBACK_LLM: LLMProvider = {
+  async generateText(_messages, _signal) {
+    throw new Error("LLM 初始化失败");
+  },
   async *streamGenerate(_messages, _signal) {
     throw new Error("LLM 初始化失败");
   }
@@ -128,7 +132,12 @@ export default function App() {
 
       setCurrentProject(project);
       setProjectPaths(nextPaths);
-      setMemoryWriter(new MemoryWriter(nextMemoryManager));
+      setMemoryWriter(
+        new MemoryWriter(
+          nextMemoryManager,
+          new MemoryExtractor(services.llm)
+        )
+      );
       setChapterIndex(nextChapterIndex);
       setRuntimeError(null);
       hydrateProject({ outline: project.outline, memory });
