@@ -10,6 +10,7 @@ import { ContextManager } from "../../source/services/context-manager.js";
 import { MemoryExtractor } from "../../source/services/memory/memory-extractor.js";
 import { MemoryManager } from "../../source/services/memory/memory-manager.js";
 import { MemoryWriter } from "../../source/services/memory/memory-writer.js";
+import type { MemoryUpdateReport } from "../../source/types/memory.js";
 import { canRunRecordedLLM, createRecordingLLM } from "../helpers/llm-recorder.js";
 import {
   buildChapterRecord,
@@ -21,6 +22,21 @@ const fixtureDir = process.env["NOVEL_TEST_FIXTURES_DIR"]?.trim()
   : path.resolve(process.cwd(), "tests/fixtures/test-novel");
 const describeLocal =
   hasLocalFixtureData() && canRunRecordedLLM(fixtureDir) ? describe : describe.skip;
+
+function calculateKeywordCoverage(text: string, keywords: string[]): {
+  matched: string[];
+  missing: string[];
+  ratio: number;
+} {
+  const matched = keywords.filter((keyword) => text.includes(keyword));
+  const missing = keywords.filter((keyword) => !text.includes(keyword));
+
+  return {
+    matched,
+    missing,
+    ratio: keywords.length === 0 ? 1 : matched.length / keywords.length
+  };
+}
 
 describeLocal("full pipeline", () => {
   it("generates chapter content with a recorded or replayed LLM", async () => {
@@ -50,9 +66,18 @@ describeLocal("full pipeline", () => {
         const context = contextManager.buildContext(chapter.plotSummary);
         const messages = buildWriterMessages(chapter.plotSummary, context);
         const generatedText = await recordingLLM.llm.generateText(messages);
+        const summaryKeywords = chapter.expected.summary?.mustContainKeywords ?? [];
+        const keywordCoverage = calculateKeywordCoverage(
+          generatedText,
+          summaryKeywords
+        );
 
         expect(generatedText.trim().length).toBeGreaterThan(100);
         expect(generatedText).toContain("陈远");
+        if (summaryKeywords.length > 0) {
+          expect(keywordCoverage.matched.length).toBeGreaterThan(0);
+          expect(keywordCoverage.ratio).toBeGreaterThanOrEqual(0.5);
+        }
 
         if (chapter.index > 1) {
           expect(context).toContain("【相关章节摘要】");
@@ -66,6 +91,35 @@ describeLocal("full pipeline", () => {
 
         expect(result.summary.summary.length).toBeGreaterThan(0);
         expect(result.timelineEvent.title).toBe(chapter.title);
+
+        const artifactPath = path.join(
+          artifactsDir,
+          `chapter-${String(chapter.index).padStart(3, "0")}`,
+          "memory-update.json"
+        );
+        const artifact = JSON.parse(
+          await fs.readFile(artifactPath, "utf8")
+        ) as MemoryUpdateReport;
+
+        expect(artifact.chapterIndex).toBe(chapter.index);
+        expect(artifact.title).toBe(chapter.title);
+        expect(artifact.createdAt).toBe(buildChapterRecord(chapter).createdAt);
+        expect(artifact.extractionMode).toBe(result.report.extractionMode);
+        expect(artifact.summary.chapterIndex).toBe(chapter.index);
+        expect(artifact.summary.title).toBe(chapter.title);
+        expect(artifact.timelineEvent.chapterIndex).toBe(chapter.index);
+        expect(artifact.timelineEvent.title).toBe(chapter.title);
+        expect(Array.isArray(artifact.matchedCharacterIds)).toBe(true);
+        expect(Array.isArray(artifact.characterChanges.updatedIds)).toBe(true);
+        expect(Array.isArray(artifact.relationChanges.addedIds)).toBe(true);
+        expect(Array.isArray(artifact.relationChanges.updatedIds)).toBe(true);
+        expect(Array.isArray(artifact.worldbookChanges.addedIds)).toBe(true);
+        expect(Array.isArray(artifact.worldbookChanges.updatedIds)).toBe(true);
+        expect(Array.isArray(artifact.foreshadowingChanges.addedIds)).toBe(true);
+        expect(Array.isArray(artifact.foreshadowingChanges.resolvedIds)).toBe(
+          true
+        );
+        expect(artifact).toEqual(result.report);
       }
 
       const finalMemory = await memoryManager.load();
