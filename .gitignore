@@ -8,4 +8,11 @@ projects/
 .DS_Store
 
 docs
-tests
+tests/*
+!tests/e2e/
+!tests/e2e/**
+!tests/helpers/
+!tests/helpers/**
+!tests/fixtures/
+tests/fixtures/*
+!tests/fixtures/.gitignore

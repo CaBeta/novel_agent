@@ -11,7 +11,12 @@
     "dev:watch": "tsx watch --exclude output --exclude dist source/cli.tsx",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/cli.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:memory": "vitest run tests/e2e/memory-pipeline.test.ts",
+    "test:retrieval": "vitest run tests/e2e/context-retrieval.test.ts",
+    "test:e2e": "vitest run tests/e2e/full-pipeline.test.ts",
+    "test:record": "LLM_RECORD=true vitest run tests/e2e/full-pipeline.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
@@ -27,6 +32,7 @@
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.13",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
   }
 }
