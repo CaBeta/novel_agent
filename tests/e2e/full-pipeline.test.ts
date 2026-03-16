@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -13,6 +14,9 @@ import { MemoryWriter } from "../../source/services/memory/memory-writer.js";
 import type { MemoryUpdateReport } from "../../source/types/memory.js";
 import { canRunRecordedLLM, createRecordingLLM } from "../helpers/llm-recorder.js";
 import {
+  expectRelationExists
+} from "../helpers/memory-assertions.js";
+import {
   buildChapterRecord,
   createTestProject
 } from "../helpers/test-project-factory.js";
@@ -20,8 +24,20 @@ import {
 const fixtureDir = process.env["NOVEL_TEST_FIXTURES_DIR"]?.trim()
   ? process.env["NOVEL_TEST_FIXTURES_DIR"]!.trim()
   : path.resolve(process.cwd(), "tests/fixtures/test-novel");
+const wantsRecording = process.env["LLM_RECORD"] === "true";
+const hasFixtures = hasLocalFixtureData();
+const chapterFixtureCount = hasFixtures
+  ? fsSync
+      .readdirSync(path.join(fixtureDir, "chapters"))
+      .filter((entry) => /^chapter_\d+\.json$/.test(entry)).length
+  : 0;
+const minRecordingCount = chapterFixtureCount * 2;
+const canRunLLM = canRunRecordedLLM(fixtureDir, {
+  minRecordingCount: wantsRecording ? 1 : minRecordingCount
+});
 const describeLocal =
-  hasLocalFixtureData() && canRunRecordedLLM(fixtureDir) ? describe : describe.skip;
+  hasFixtures && (canRunLLM || wantsRecording) ? describe : describe.skip;
+const fullPipelineTimeoutMs = wantsRecording ? 60 * 60 * 1000 : 60 * 1000;
 
 function calculateKeywordCoverage(text: string, keywords: string[]): {
   matched: string[];
@@ -39,98 +55,115 @@ function calculateKeywordCoverage(text: string, keywords: string[]): {
 }
 
 describeLocal("full pipeline", () => {
-  it("generates chapter content with a recorded or replayed LLM", async () => {
-    const fixture = await loadFixtureData();
-    const workspace = await createTestProject(fixture.project);
-    const recordingLLM = await createRecordingLLM(fixture.fixtureDir);
-
-    try {
-      const memoryManager = new MemoryManager(workspace.projectPaths);
-      await memoryManager.initialize(workspace.project);
-      const memoryWriter = new MemoryWriter(
-        memoryManager,
-        new MemoryExtractor(recordingLLM.llm)
-      );
-      const contextManager = new ContextManager();
-      const artifactsDir = path.join(workspace.projectPaths.artifactsDir, "e2e");
-
-      await fs.mkdir(artifactsDir, { recursive: true });
-
-      for (const chapter of fixture.chapters) {
-        const currentMemory = await memoryManager.load();
-        contextManager.loadProject({
-          outline: fixture.project.outline,
-          memory: currentMemory
-        });
-
-        const context = contextManager.buildContext(chapter.plotSummary);
-        const messages = buildWriterMessages(chapter.plotSummary, context);
-        const generatedText = await recordingLLM.llm.generateText(messages);
-        const summaryKeywords = chapter.expected.summary?.mustContainKeywords ?? [];
-        const keywordCoverage = calculateKeywordCoverage(
-          generatedText,
-          summaryKeywords
+  it(
+    "generates chapter content with a recorded or replayed LLM",
+    async () => {
+      if (wantsRecording && !canRunLLM) {
+        throw new Error(
+          "LLM_RECORD=true 但当前不可录制。请确认已加载 .env，且设置了 DEEPSEEK_API_KEY 或 OPENAI_API_KEY。"
         );
+      }
 
-        expect(generatedText.trim().length).toBeGreaterThan(100);
-        expect(generatedText).toContain("陈远");
-        if (summaryKeywords.length > 0) {
-          expect(keywordCoverage.matched.length).toBeGreaterThan(0);
-          expect(keywordCoverage.ratio).toBeGreaterThanOrEqual(0.5);
-        }
+      const fixture = await loadFixtureData();
+      const workspace = await createTestProject(fixture.project);
+      const recordingLLM = await createRecordingLLM(fixture.fixtureDir);
 
-        if (chapter.index > 1) {
-          expect(context).toContain("【相关章节摘要】");
-        }
+      try {
+        const memoryManager = new MemoryManager(workspace.projectPaths);
+        await memoryManager.initialize(workspace.project);
+        const memoryWriter = new MemoryWriter(
+          memoryManager,
+          new MemoryExtractor(recordingLLM.llm)
+        );
+        const contextManager = new ContextManager();
+        const artifactsDir = path.join(workspace.projectPaths.artifactsDir, "e2e");
 
-        const result = await memoryWriter.recordChapter({
-          ...buildChapterRecord(chapter),
-          content: generatedText,
-          artifactsDir
-        });
+        await fs.mkdir(artifactsDir, { recursive: true });
+
+        for (const chapter of fixture.chapters) {
+          const currentMemory = await memoryManager.load();
+          contextManager.loadProject({
+            outline: fixture.project.outline,
+            memory: currentMemory
+          });
+
+          const context = contextManager.buildContext(chapter.plotSummary);
+          const messages = buildWriterMessages(chapter.plotSummary, context);
+          const generatedText = await recordingLLM.llm.generateText(messages);
+          const summaryKeywords = chapter.expected.summary?.mustContainKeywords ?? [];
+          const keywordCoverage = calculateKeywordCoverage(
+            generatedText,
+            summaryKeywords
+          );
+
+          expect(generatedText.trim().length).toBeGreaterThan(100);
+          expect(generatedText).toContain("陈远");
+          if (summaryKeywords.length > 0) {
+            expect(keywordCoverage.matched.length).toBeGreaterThan(0);
+            expect(keywordCoverage.ratio).toBeGreaterThanOrEqual(0.5);
+          }
+
+          if (chapter.index > 1) {
+            expect(context).toContain("【相关章节摘要】");
+          }
+
+          const result = await memoryWriter.recordChapter({
+            ...buildChapterRecord(chapter),
+            content: generatedText,
+            artifactsDir
+          });
 
         expect(result.summary.summary.length).toBeGreaterThan(0);
         expect(result.timelineEvent.title).toBe(chapter.title);
+        if ((chapter.expected.relations?.length ?? 0) > 0) {
+          expectRelationExists(result.memory.relations, chapter.expected.relations ?? []);
+        }
+        if ((chapter.expected.worldbookEntries?.length ?? 0) > 0) {
+          expect(Array.isArray(result.memory.worldbook)).toBe(true);
+        }
+        expect(Array.isArray(result.memory.foreshadowing)).toBe(true);
 
         const artifactPath = path.join(
-          artifactsDir,
-          `chapter-${String(chapter.index).padStart(3, "0")}`,
-          "memory-update.json"
-        );
-        const artifact = JSON.parse(
-          await fs.readFile(artifactPath, "utf8")
-        ) as MemoryUpdateReport;
+            artifactsDir,
+            `chapter-${String(chapter.index).padStart(3, "0")}`,
+            "memory-update.json"
+          );
+          const artifact = JSON.parse(
+            await fs.readFile(artifactPath, "utf8")
+          ) as MemoryUpdateReport;
 
-        expect(artifact.chapterIndex).toBe(chapter.index);
-        expect(artifact.title).toBe(chapter.title);
-        expect(artifact.createdAt).toBe(buildChapterRecord(chapter).createdAt);
-        expect(artifact.extractionMode).toBe(result.report.extractionMode);
-        expect(artifact.summary.chapterIndex).toBe(chapter.index);
-        expect(artifact.summary.title).toBe(chapter.title);
-        expect(artifact.timelineEvent.chapterIndex).toBe(chapter.index);
-        expect(artifact.timelineEvent.title).toBe(chapter.title);
-        expect(Array.isArray(artifact.matchedCharacterIds)).toBe(true);
-        expect(Array.isArray(artifact.characterChanges.updatedIds)).toBe(true);
-        expect(Array.isArray(artifact.relationChanges.addedIds)).toBe(true);
-        expect(Array.isArray(artifact.relationChanges.updatedIds)).toBe(true);
-        expect(Array.isArray(artifact.worldbookChanges.addedIds)).toBe(true);
-        expect(Array.isArray(artifact.worldbookChanges.updatedIds)).toBe(true);
-        expect(Array.isArray(artifact.foreshadowingChanges.addedIds)).toBe(true);
-        expect(Array.isArray(artifact.foreshadowingChanges.resolvedIds)).toBe(
+          expect(artifact.chapterIndex).toBe(chapter.index);
+          expect(artifact.title).toBe(chapter.title);
+          expect(artifact.createdAt).toBe(buildChapterRecord(chapter).createdAt);
+          expect(artifact.extractionMode).toBe(result.report.extractionMode);
+          expect(artifact.summary.chapterIndex).toBe(chapter.index);
+          expect(artifact.summary.title).toBe(chapter.title);
+          expect(artifact.timelineEvent.chapterIndex).toBe(chapter.index);
+          expect(artifact.timelineEvent.title).toBe(chapter.title);
+          expect(Array.isArray(artifact.matchedCharacterIds)).toBe(true);
+          expect(Array.isArray(artifact.characterChanges.updatedIds)).toBe(true);
+          expect(Array.isArray(artifact.relationChanges.addedIds)).toBe(true);
+          expect(Array.isArray(artifact.relationChanges.updatedIds)).toBe(true);
+          expect(Array.isArray(artifact.worldbookChanges.addedIds)).toBe(true);
+          expect(Array.isArray(artifact.worldbookChanges.updatedIds)).toBe(true);
+          expect(Array.isArray(artifact.foreshadowingChanges.addedIds)).toBe(true);
+          expect(Array.isArray(artifact.foreshadowingChanges.resolvedIds)).toBe(
+            true
+          );
+          expect(artifact).toEqual(result.report);
+        }
+
+        const finalMemory = await memoryManager.load();
+        expect(finalMemory.summaries).toHaveLength(fixture.chapters.length);
+        expect(finalMemory.timeline).toHaveLength(fixture.chapters.length);
+        expect(finalMemory.characters.length).toBeGreaterThan(0);
+        expect(recordingLLM.mode === "record" || recordingLLM.mode === "replay").toBe(
           true
         );
-        expect(artifact).toEqual(result.report);
+      } finally {
+        await workspace.cleanup();
       }
-
-      const finalMemory = await memoryManager.load();
-      expect(finalMemory.summaries).toHaveLength(fixture.chapters.length);
-      expect(finalMemory.timeline).toHaveLength(fixture.chapters.length);
-      expect(finalMemory.characters.length).toBeGreaterThan(0);
-      expect(recordingLLM.mode === "record" || recordingLLM.mode === "replay").toBe(
-        true
-      );
-    } finally {
-      await workspace.cleanup();
-    }
-  });
+    },
+    fullPipelineTimeoutMs
+  );
 });

@@ -6,6 +6,7 @@ import {
   loadFixtureData
 } from "../helpers/fixture-loader.js";
 import {
+  expectRelationExists,
   expectMentionedCharacters,
   expectTimelineParticipants
 } from "../helpers/memory-assertions.js";
@@ -56,6 +57,16 @@ describeLocal("memory pipeline", () => {
             result,
             chapter.expected.timeline?.participantsMustInclude ?? []
           );
+        }
+
+        if ((chapter.expected.relations?.length ?? 0) > 0) {
+          const stableExpectedRelations = (chapter.expected.relations ?? []).filter(
+            (relation) =>
+              knownCharacterNames.has(relation.from) &&
+              knownCharacterNames.has(relation.to)
+          );
+
+          expectRelationExists(result.memory.relations, stableExpectedRelations);
         }
       }
 

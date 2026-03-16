@@ -78,18 +78,27 @@ export function resolveRecordingsDir(fixtureDir: string): string {
 }
 
 export function hasRecordings(fixtureDir: string): boolean {
+  return getRecordingCount(fixtureDir) > 0;
+}
+
+export function getRecordingCount(fixtureDir: string): number {
   const recordingsDir = resolveRecordingsDir(fixtureDir);
   if (!fs.existsSync(recordingsDir)) {
-    return false;
+    return 0;
   }
 
   return fs
     .readdirSync(recordingsDir)
-    .some((entry) => entry.endsWith(".json"));
+    .filter((entry) => entry.endsWith(".json")).length;
 }
 
-export function canRunRecordedLLM(fixtureDir: string): boolean {
-  if (hasRecordings(fixtureDir)) {
+export function canRunRecordedLLM(
+  fixtureDir: string,
+  options: { minRecordingCount?: number } = {}
+): boolean {
+  const minRecordingCount = options.minRecordingCount ?? 1;
+
+  if (getRecordingCount(fixtureDir) >= minRecordingCount) {
     return true;
   }
 
@@ -126,17 +135,17 @@ export async function createRecordingLLM(
       const key = hashMessages(messages);
       const filepath = path.join(recordingsDir, `${key}.json`);
 
-      if (mode === "replay") {
-        if (!fs.existsSync(filepath)) {
-          throw new Error(
-            `缺少录制文件: ${filepath}。请先使用 LLM_RECORD=true 运行 test:record。`
-          );
-        }
-
+      if (fs.existsSync(filepath)) {
         const recorded = JSON.parse(
           await fs.promises.readFile(filepath, "utf8")
         ) as RecordedResponse;
         return recorded.response;
+      }
+
+      if (mode === "replay") {
+        throw new Error(
+          `缺少录制文件: ${filepath}。请先使用 LLM_RECORD=true 运行 test:record。`
+        );
       }
 
       if (!delegate) {
