@@ -69,6 +69,13 @@ export interface AssistantMessage extends Message {
   role: "assistant";
   toolCalls?: ToolCall[];
 }
+
+// OpenAI tools 参数格式 (统一定义在 types/index.ts)
+export interface FunctionDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>; // JSON Schema
+}
 ```
 
 **Step 2: 定义 Agent 核心类型**
@@ -76,7 +83,7 @@ export interface AssistantMessage extends Message {
 ```typescript
 // source/agent/types.ts
 import { z, type ZodTypeAny } from "zod";
-import type { Message, ToolCall } from "../types/index.js";
+import type { Message, ToolCall, FunctionDefinition } from "../types/index.js";
 
 // 修复: parameters 是 ZodSchema 本身,不是 infer 后的类型
 export interface Tool<TSchema extends ZodTypeAny = ZodTypeAny> {
@@ -98,6 +105,11 @@ export interface AgentState {
   lastAction?: string;
   lastObservation?: string;
   pendingToolCalls?: ToolCall[];
+  // 修复 P2: 持久化用户提问状态
+  pendingQuestion?: {
+    question: string;
+    options?: string[];
+  };
 }
 
 // 使用扩展后的 Message 类型
@@ -114,13 +126,6 @@ export interface SubAgentResult {
   success: boolean;
   output: string;
   error?: string;
-}
-
-// OpenAI tools 参数格式
-export interface FunctionDefinition {
-  name: string;
-  description: string;
-  parameters: Record<string, unknown>; // JSON Schema
 }
 
 // 用户交互回调类型
@@ -439,8 +444,12 @@ export class AgentRuntime {
           return response.content;
         }
 
-        // 添加助手消息
-        const assistantMsg: Message = { role: "assistant", content: response.content };
+        // 修复 P2: 保存完整的 assistant 消息,包含 toolCalls
+        const assistantMsg: Message = {
+          role: "assistant",
+          content: response.content ?? "",
+          toolCalls: response.toolCalls  // 关键: 必须保存 toolCalls
+        } as Message;
         this.messages.push(assistantMsg);
 
         // 并行执行所有工具调用 (修复 P1 并行问题)
@@ -581,36 +590,69 @@ import type { Tool, ToolResult } from "../types.js";
 
 const execAsync = promisify(exec);
 
-// 允许的命令白名单
+// 允许的命令白名单 (修复 P4 - 移除高风险命令)
 const ALLOWED_COMMANDS = [
-  // 文件读取
+  // 文件读取 (只读)
   "cat", "head", "tail", "less", "more",
-  // 文件列表
+  // 文件列表 (只读)
   "ls", "find", "tree",
-  // 目录操作
-  "mkdir", "pwd",
-  // 文件搜索
+  // 目录操作 (安全)
+  "pwd",
+  // 文件搜索 (只读)
   "grep", "rg", "ag", "ack",
-  // 文本处理
-  "wc", "sort", "uniq", "cut", "awk", "sed",
-  // 项目相关
-  "git", "npm", "pnpm", "yarn",
+  // 文本处理 (只读)
+  "wc", "sort", "uniq", "cut",
   // 其他安全命令
   "echo", "date", "which"
 ];
 
-// 危险命令模式
+// 扩展白名单 (需要显式启用,默认禁用)
+const EXTENDED_COMMANDS = {
+  // 写入操作 - 需要显式启用
+  mkdir: "mkdir",
+  sed: "sed",
+  awk: "awk",
+  // 项目工具 - 可能有危险操作,需要额外检查
+  git: "git",
+  npm: "npm",
+  pnpm: "pnpm"
+};
+
+// 危险命令模式 (修复 P4 - 扩展危险模式)
 const DANGEROUS_PATTERNS = [
-  /\brm\s+-rf\b/,
-  /\brm\s+.*\*/,
+  // 文件删除
+  /\brm\s+/,
+  /\brmdir\b/,
+  // 权限修改
   /\bsudo\b/,
   /\bchmod\b/,
   /\bchown\b/,
+  // 设备操作
   /\b>\s*\/dev\//,
   /\bmkfs\b/,
   /\bdd\b/,
   /\bformat\b/,
-  /\b:\(\)\{\s*:\|:\s*&\s*\};\s*:/, // fork bomb
+  // 网络操作
+  /\bcurl\b.*\|\s*(ba)?sh\b/,
+  /\bwget\b.*\|\s*(ba)?sh\b/,
+  // Fork bomb
+  /\b:\(\)\{\s*:\|:\s*&\s*\};\s*:/,
+  // Git 危险操作
+  /\bgit\s+(push\s+)?--force\b/,
+  /\bgit\s+reset\s+--hard\b/,
+  /\bgit\s+clean\s+-[fd]/,
+  /\bgit\s+checkout\s+--\s*\./,
+  // NPM 危险操作
+  /\bnpm\s+run\s+\w+/,
+  /\bpnpm\s+run\s+\w+/,
+  // 环境变量泄露
+  /\benv\b/,
+  /\bprintenv\b/,
+  /\bexport\b.*\b(PATH|HOME|USER|PASSWORD|KEY|SECRET|TOKEN)\b/i,
+  // 脚本执行
+  /\beval\b/,
+  /\bexec\b/,
+  /\bsource\b.*\.\//,
 ];
 
 const BashToolSchema = z.object({
@@ -621,10 +663,36 @@ const BashToolSchema = z.object({
 interface BashToolConfig {
   workingDirectory: string;
   allowedCommands?: string[];
+  // 修复 P4: 显式启用扩展命令
+  enableExtendedCommands?: {
+    mkdir?: boolean;
+    sed?: boolean;
+    awk?: boolean;
+    git?: boolean;    // 仍会进行危险操作检查
+    npm?: boolean;    // 仍会进行危险操作检查
+    pnpm?: boolean;   // 仍会进行危险操作检查
+  };
 }
 
 export function createBashTool(config: BashToolConfig): Tool {
-  const allowedCommands = config.allowedCommands ?? ALLOWED_COMMANDS;
+  // 基础白名单
+  let allowedCommands = [...ALLOWED_COMMANDS];
+
+  // 添加启用的扩展命令
+  if (config.enableExtendedCommands) {
+    const { enableExtendedCommands: ext } = config;
+    if (ext.mkdir) allowedCommands.push("mkdir");
+    if (ext.sed) allowedCommands.push("sed");
+    if (ext.awk) allowedCommands.push("awk");
+    if (ext.git) allowedCommands.push("git");
+    if (ext.npm) allowedCommands.push("npm");
+    if (ext.pnpm) allowedCommands.push("pnpm");
+  }
+
+  // 允许用户自定义覆盖
+  if (config.allowedCommands) {
+    allowedCommands = config.allowedCommands;
+  }
 
   return {
     name: "bash",
@@ -804,15 +872,19 @@ git commit -m "feat(agent): add generate_content tool implementation"
 ```typescript
 // source/agent/tools/ask-user.ts
 import { z } from "zod";
-import type { Tool, ToolResult, UserInteraction } from "../types.js";
+import type { Tool, ToolResult, UserInteraction, AgentState } from "../types.js";
+import type { StateStore } from "../state-store.js";
 
 const AskUserSchema = z.object({
   question: z.string().describe("The question to ask the user"),
   options: z.array(z.string()).optional().describe("Optional predefined options")
 });
 
+// 修复 P5: 添加 StateStore 参数实现持久化
 interface AskUserToolConfig {
   userInteraction: UserInteraction;
+  stateStore: StateStore;
+  onStateChange: (state: Partial<AgentState>) => void;
 }
 
 export function createAskUserTool(config: AskUserToolConfig): Tool {
@@ -822,12 +894,39 @@ export function createAskUserTool(config: AskUserToolConfig): Tool {
     parameters: AskUserSchema,
     execute: async (params: z.infer<typeof AskUserSchema>): Promise<ToolResult> => {
       try {
+        // 修复 P5: 在等待用户前持久化状态
+        const waitingState: AgentState = {
+          status: "waiting_for_user",
+          pendingQuestion: {
+            question: params.question,
+            options: params.options
+          }
+        };
+
+        // 通知状态变更
+        config.onStateChange(waitingState);
+
+        // 持久化等待状态 (支持断点恢复)
+        await config.stateStore.saveState(waitingState);
+
+        // 等待用户回答
         const answer = await config.userInteraction.askUser(
           params.question,
           params.options
         );
+
+        // 清除等待状态
+        const completedState: AgentState = {
+          status: "thinking",
+          pendingQuestion: undefined
+        };
+        config.onStateChange(completedState);
+        await config.stateStore.saveState(completedState);
+
         return { output: answer };
       } catch (error) {
+        // 错误时也要清除等待状态
+        config.onStateChange({ status: "error", pendingQuestion: undefined });
         return {
           output: "",
           error: error instanceof Error ? error.message : "Unknown error"
@@ -1180,12 +1279,15 @@ export function createQualityCheckSubAgent(context: SubAgentContext): SubAgent {
 }
 ```
 
-**Step 3: 实现 memory_update SubAgent**
+**Step 3: 实现 memory_update SubAgent (修复 P3 - 真正接入 MemoryManager)**
 
 ```typescript
 // source/agent/subagents/memory-update.ts
 import type { SubAgent, SubAgentContext } from "./index.js";
 import type { SubAgentConfig, SubAgentResult } from "../types.js";
+import { MemoryManager } from "../../services/memory/memory-manager.js";
+import { resolveProjectPaths } from "../../services/project/project-paths.js";
+import type { CharacterMemory, TimelineEvent } from "../../types/memory.js";
 
 const MEMORY_UPDATE_PROMPT = `你是记忆提取专家。请从给定的章节内容中提取以下记忆信息:
 
@@ -1207,6 +1309,7 @@ export function createMemoryUpdateSubAgent(context: SubAgentContext): SubAgent {
     type: "memory_update",
     execute: async (config: SubAgentConfig): Promise<SubAgentResult> => {
       try {
+        // 1. 使用 LLM 提取记忆
         const messages = [
           { role: "system" as const, content: MEMORY_UPDATE_PROMPT },
           { role: "user" as const, content: `请从以下内容中提取记忆:\n\n${config.task}` }
@@ -1228,12 +1331,79 @@ export function createMemoryUpdateSubAgent(context: SubAgentContext): SubAgent {
           };
         }
 
-        // TODO: 将记忆写入 MemoryManager
+        // 修复 P3: 真正接入 MemoryManager
+        const extractedData = JSON.parse(jsonMatch[0]);
+        const projectPaths = resolveProjectPaths(
+          context.projectPath,
+          path.basename(context.projectPath)
+        );
+        const memoryManager = new MemoryManager(projectPaths);
+
+        // 加载现有记忆
+        const existingMemory = await memoryManager.load();
+
+        // 合并新角色
+        if (extractedData.characters?.length > 0) {
+          const newCharacters: CharacterMemory[] = extractedData.characters.map((c: any) => ({
+            id: `character-${c.name.toLowerCase().replace(/\s+/g, "-")}`,
+            name: c.name,
+            description: c.description ?? "",
+            traits: c.traits ?? [],
+            goals: [],
+            secrets: [],
+            currentStatus: c.description ?? "",
+            aliases: [],
+            latestSummary: "",
+            lastSeenChapter: null,
+            recentEvents: [],
+            sourceChapterIndices: []
+          }));
+
+          // 去重合并
+          for (const newChar of newCharacters) {
+            const existingIndex = existingMemory.characters.findIndex(
+              c => c.name.toLowerCase() === newChar.name.toLowerCase()
+            );
+            if (existingIndex >= 0) {
+              // 更新现有角色
+              existingMemory.characters[existingIndex] = {
+                ...existingMemory.characters[existingIndex],
+                ...newChar,
+                traits: [...new Set([...existingMemory.characters[existingIndex].traits, ...newChar.traits])]
+              };
+            } else {
+              existingMemory.characters.push(newChar);
+            }
+          }
+        }
+
+        // 合并新事件到时间线
+        if (extractedData.events?.length > 0) {
+          const newEvents: TimelineEvent[] = extractedData.events.map((e: any, i: number) => ({
+            id: `event-${Date.now()}-${i}`,
+            chapterIndex: e.chapter ?? 0,
+            title: e.name,
+            summary: e.description,
+            participants: [],
+            consequences: [],
+            keywords: [e.name],
+            occurredAt: new Date().toISOString()
+          }));
+          existingMemory.timeline.push(...newEvents);
+        }
+
+        // 写入更新后的记忆
+        await memoryManager.writeAll(existingMemory);
 
         return {
           type: "memory_update",
           success: true,
-          output: jsonMatch[0]
+          output: JSON.stringify({
+            charactersAdded: extractedData.characters?.length ?? 0,
+            eventsAdded: extractedData.events?.length ?? 0,
+            totalCharacters: existingMemory.characters.length,
+            totalEvents: existingMemory.timeline.length
+          })
         };
       } catch (error) {
         return {
@@ -1457,9 +1627,18 @@ export default function App() {
   const [runtime, setRuntime] = useState<AgentRuntime | null>(null);
   const questionResolveRef = useRef<((answer: string) => void) | null>(null);
 
-  // 初始化 Agent
+  // 初始化 Agent (修复 P6: 对齐真实 API)
   const initializeAgent = useCallback((project: NovelProject, paths: ProjectPaths) => {
-    const llmProvider = createLLMProvider(/* config */);
+    // 从配置加载 LLM 设置
+    const config = loadNovelConfig();
+    const apiKey = resolveApiKey(config.llm.provider);
+    const llmConfig = {
+      model: config.llm.model,
+      temperature: config.llm.temperature,
+      maxTokens: config.llm.maxTokens,
+      ...(config.llm.baseURL ? { baseURL: config.llm.baseURL } : {})
+    };
+    const llmProvider = createLLMProvider(config.llm.provider, apiKey, llmConfig);
     const stateStore = new StateStore({ projectPath: paths.rootDir });
 
     // 修复 P2: 实现用户交互回调
@@ -1575,9 +1754,11 @@ Task 11 (UI) ──────────────────────�
 ## 验收标准
 
 1. **类型正确**: Message 支持 tool role, Tool.parameters 是 ZodSchema
-2. **协议完整**: 使用 OpenAI Function Calling,无 TODO
+2. **协议完整**: 使用 OpenAI Function Calling, assistant 消息保存 toolCalls
 3. **真正并行**: 多个工具调用使用 Promise.all 并行执行
-4. **沙箱安全**: bash 工具有白名单和工作目录限制
-5. **用户交互**: ask_user 正确接入 Runtime, UI 支持问答
-6. **断点恢复**: StateStore 在 Runtime 生命周期中被调用
-7. **测试通过**: 所有新增代码有对应测试
+4. **沙箱安全**: bash 工具有白名单 (默认禁用 git/npm) 和工作目录限制
+5. **用户交互**: ask_user 持久化等待状态, UI 支持问答和断点恢复
+6. **断点恢复**: StateStore 在 Runtime 生命周期中被调用, resume() 可恢复
+7. **记忆闭环**: memory_update 真正接入 MemoryManager, 无 TODO
+8. **App 集成**: createLLMProvider 使用真实签名 (provider, apiKey, config)
+9. **测试通过**: 所有新增代码有对应测试
