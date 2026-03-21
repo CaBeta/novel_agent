@@ -1207,6 +1207,8 @@ git commit -m "feat(agent): add StateStore for persistence and recovery"
 // source/agent/subagents/index.ts
 import type { LLMProvider } from "../../services/llm/types.js";
 import type { SubAgentConfig, SubAgentResult } from "../types.js";
+import type { ProjectPaths } from "../../types/project.js";
+import { resolveProjectPaths } from "../../services/project/project-paths.js";
 import { createQualityCheckSubAgent } from "./quality-check.js";
 import { createMemoryUpdateSubAgent } from "./memory-update.js";
 import { createOutlineGenSubAgent } from "./outline-gen.js";
@@ -1229,6 +1231,9 @@ export interface SubAgentContext {
 export function getProjectPaths(context: SubAgentContext): ProjectPaths {
   return resolveProjectPaths(context.workspaceRoot, context.projectSlug);
 }
+
+// 修复 P1: 添加 createSubAgentRunner 函数声明
+export function createSubAgentRunner(context: SubAgentContext) {
   const subagents: Map<string, SubAgent> = new Map([
     ["quality_check", createQualityCheckSubAgent(context)],
     ["memory_update", createMemoryUpdateSubAgent(context)],
@@ -1606,8 +1611,9 @@ export function AgentView({
 
       {/* 用户提问区 (修复 P2) */}
       {pendingQuestion && (
-        <Box flexDirection="column" marginBottom={1} borderStyle="round" borderColor="magenta" paddingX={1}>
-          <Text color="magenta" bold>Agent 提问:</Text>
+        // 修复 P2: 使用 Layout 支持的颜色 (blue/yellow/green/red/gray)
+        <Box flexDirection="column" marginBottom={1} borderStyle="round" borderColor="yellow" paddingX={1}>
+          <Text color="yellow" bold>Agent 提问:</Text>
           <Text>{pendingQuestion.question}</Text>
           {pendingQuestion.options && (
             <Box flexDirection="column" marginTop={1}>
@@ -1693,17 +1699,29 @@ export default function App() {
     };
 
     // 修复 P8: 传入正确的路径参数
+    // 修复 P1: 使用 project.slug 而非 currentProject.slug
     const subAgentRunner = createSubAgentRunner({
       llmProvider,
       workspaceRoot: paths.rootDir,      // 工作区根目录
-      projectSlug: currentProject.slug   // 项目 slug
+      projectSlug: project.slug          // 项目 slug (使用参数,非 state)
     });
 
+    // 修复 P2: 传入完整参数
     const tools = createCoreTools({
       llmProvider,
       userInteraction,
       subAgentRunner,
-      workingDirectory: paths.rootDir
+      workingDirectory: paths.rootDir,
+      stateStore,
+      onStateChange: (state) => {
+        if (state.status === "waiting_for_user" && state.pendingQuestion) {
+          setPendingQuestion({
+            question: state.pendingQuestion.question,
+            options: state.pendingQuestion.options,
+            resolve: () => {} // placeholder, 实际由 ask_user 设置
+          });
+        }
+      }
     });
 
     const agentRuntime = new AgentRuntime({
@@ -1724,16 +1742,8 @@ export default function App() {
     const checkResume = async () => {
       const resumed = await runtime.resume();
       if (resumed) {
-        // 有待恢复的任务,自动继续执行
-        setIsThinking(true);
-        try {
-          const result = await runtime.continue();
-          setAgentOutput(result);
-        } catch (error) {
-          setAgentOutput(error instanceof Error ? error.message : "恢复执行失败");
-        } finally {
-          setIsThinking(false);
-        }
+        // 有待恢复的任务,显示恢复提示
+        setAgentOutput(`检测到未完成的任务: ${resumed}\n请重新输入指令继续,或输入新的指令。`);
       }
     };
 
