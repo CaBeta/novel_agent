@@ -263,8 +263,10 @@ export class OpenAIProvider implements LLMProvider {
     };
   }
 
+  // 修复 P9: 完整转换消息,包括 assistant 的 tool_calls
   private convertMessages(messages: Message[]): OpenAI.ChatCompletionMessageParam[] {
     return messages.map(msg => {
+      // tool 角色消息
       if (msg.role === "tool") {
         return {
           role: "tool",
@@ -272,6 +274,31 @@ export class OpenAIProvider implements LLMProvider {
           tool_call_id: msg.toolCallId
         } as OpenAI.ChatCompletionToolMessageParam;
       }
+
+      // assistant 消息,可能包含 tool_calls
+      if (msg.role === "assistant") {
+        const assistantMsg = msg as Message & { toolCalls?: ToolCall[] };
+        if (assistantMsg.toolCalls && assistantMsg.toolCalls.length > 0) {
+          return {
+            role: "assistant",
+            content: msg.content,
+            tool_calls: assistantMsg.toolCalls.map(tc => ({
+              id: tc.id,
+              type: "function" as const,
+              function: {
+                name: tc.function.name,
+                arguments: tc.function.arguments
+              }
+            }))
+          } as OpenAI.ChatCompletionAssistantMessageParam;
+        }
+        return {
+          role: "assistant",
+          content: msg.content
+        } as OpenAI.ChatCompletionAssistantMessageParam;
+      }
+
+      // 其他角色 (system, user)
       return {
         role: msg.role,
         content: msg.content
@@ -1037,13 +1064,21 @@ export interface CreateToolsConfig {
   userInteraction: UserInteraction;
   subAgentRunner: (config: SubAgentConfig) => Promise<SubAgentResult>;
   workingDirectory: string;
+  // 修复 P7: ask_user 需要的额外参数
+  stateStore: StateStore;
+  onStateChange: (state: Partial<AgentState>) => void;
 }
 
 export function createCoreTools(config: CreateToolsConfig): Tool[] {
   return [
     createBashTool({ workingDirectory: config.workingDirectory }),
     createGenerateContentTool({ llmProvider: config.llmProvider }),
-    createAskUserTool({ userInteraction: config.userInteraction }),
+    // 修复 P7: 传入完整参数
+    createAskUserTool({
+      userInteraction: config.userInteraction,
+      stateStore: config.stateStore,
+      onStateChange: config.onStateChange
+    }),
     createDispatchAgentTool({ subAgentRunner: config.subAgentRunner })
   ];
 }
@@ -1181,12 +1216,19 @@ export interface SubAgent {
   execute(config: SubAgentConfig): Promise<SubAgentResult>;
 }
 
+// 修复 P8: 明确区分工作区根目录和项目路径
 export interface SubAgentContext {
   llmProvider: LLMProvider;
-  projectPath: string;
+  // 工作区根目录 (包含多个项目的目录)
+  workspaceRoot: string;
+  // 当前项目 slug
+  projectSlug: string;
 }
 
-export function createSubAgentRunner(context: SubAgentContext) {
+// 工具函数: 从 SubAgentContext 获取 ProjectPaths
+export function getProjectPaths(context: SubAgentContext): ProjectPaths {
+  return resolveProjectPaths(context.workspaceRoot, context.projectSlug);
+}
   const subagents: Map<string, SubAgent> = new Map([
     ["quality_check", createQualityCheckSubAgent(context)],
     ["memory_update", createMemoryUpdateSubAgent(context)],
@@ -1333,10 +1375,9 @@ export function createMemoryUpdateSubAgent(context: SubAgentContext): SubAgent {
 
         // 修复 P3: 真正接入 MemoryManager
         const extractedData = JSON.parse(jsonMatch[0]);
-        const projectPaths = resolveProjectPaths(
-          context.projectPath,
-          path.basename(context.projectPath)
-        );
+
+        // 修复 P8: 使用正确的路径获取方式
+        const projectPaths = getProjectPaths(context);
         const memoryManager = new MemoryManager(projectPaths);
 
         // 加载现有记忆
@@ -1651,9 +1692,11 @@ export default function App() {
       }
     };
 
+    // 修复 P8: 传入正确的路径参数
     const subAgentRunner = createSubAgentRunner({
       llmProvider,
-      projectPath: paths.rootDir
+      workspaceRoot: paths.rootDir,      // 工作区根目录
+      projectSlug: currentProject.slug   // 项目 slug
     });
 
     const tools = createCoreTools({
@@ -1673,6 +1716,29 @@ export default function App() {
 
     setRuntime(agentRuntime);
   }, []);
+
+  // 修复 P10: 初始化时检查恢复
+  useEffect(() => {
+    if (!runtime) return;
+
+    const checkResume = async () => {
+      const resumed = await runtime.resume();
+      if (resumed) {
+        // 有待恢复的任务,自动继续执行
+        setIsThinking(true);
+        try {
+          const result = await runtime.continue();
+          setAgentOutput(result);
+        } catch (error) {
+          setAgentOutput(error instanceof Error ? error.message : "恢复执行失败");
+        } finally {
+          setIsThinking(false);
+        }
+      }
+    };
+
+    void checkResume();
+  }, [runtime]);
 
   // 处理用户回答 (修复 P2)
   const handleAnswerQuestion = useCallback((answer: string) => {
@@ -1747,6 +1813,228 @@ Task 4-8 (Tools) ─────────────────────
 Task 9 (StateStore) ─────────────────────────────────┤
                                                       │
 Task 11 (UI) ─────────────────────────────────────────┘
+```
+
+---
+
+## Task 12: 测试任务 (修复 P11)
+
+**Files:**
+- Create: `tests/agent/runtime.test.ts`
+- Create: `tests/agent/tools/bash.test.ts`
+- Create: `tests/agent/tools/ask-user.test.ts`
+- Create: `tests/agent/tools/dispatch-agent.test.ts`
+
+**Step 1: Runtime 测试**
+
+```typescript
+// tests/agent/runtime.test.ts
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { AgentRuntime } from "../../source/agent/runtime.js";
+import { StateStore } from "../../source/agent/state-store.js";
+import type { LLMProvider } from "../../source/services/llm/types.js";
+import type { Tool } from "../../source/agent/types.js";
+
+// Mock LLM Provider
+const mockLLMProvider: LLMProvider = {
+  generateText: vi.fn(),
+  streamGenerate: vi.fn(),
+  generateWithTools: vi.fn()
+};
+
+const mockStateStore = {
+  saveState: vi.fn(),
+  loadState: vi.fn(),
+  saveConversation: vi.fn(),
+  loadConversation: vi.fn()
+};
+
+describe("AgentRuntime", () => {
+  let runtime: AgentRuntime;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runtime = new AgentRuntime({
+      systemPrompt: "Test prompt",
+      tools: [],
+      llmProvider: mockLLMProvider,
+      stateStore: mockStateStore as any,
+      userInteraction: { askUser: vi.fn() }
+    });
+  });
+
+  it("should initialize with idle status", () => {
+    expect(runtime.getState().status).toBe("idle");
+  });
+
+  it("should complete without tool calls", async () => {
+    vi.mocked(mockLLMProvider.generateWithTools).mockResolvedValue({
+      content: "Task completed",
+      toolCalls: undefined
+    });
+
+    const result = await runtime.run("test input");
+    expect(result).toBe("Task completed");
+    expect(runtime.getState().status).toBe("completed");
+  });
+
+  it("should execute tools in parallel", async () => {
+    const toolResults = new Map<string, string>();
+
+    const mockTool1: Tool = {
+      name: "tool1",
+      description: "Test tool 1",
+      parameters: z.object({ input: z.string() }),
+      execute: async (params) => {
+        await new Promise(r => setTimeout(r, 100));
+        toolResults.set("tool1", params.input);
+        return { output: "tool1 result" };
+      }
+    };
+
+    const mockTool2: Tool = {
+      name: "tool2",
+      description: "Test tool 2",
+      parameters: z.object({ input: z.string() }),
+      execute: async (params) => {
+        await new Promise(r => setTimeout(r, 100));
+        toolResults.set("tool2", params.input);
+        return { output: "tool2 result" };
+      }
+    };
+
+    runtime = new AgentRuntime({
+      systemPrompt: "Test",
+      tools: [mockTool1, mockTool2],
+      llmProvider: mockLLMProvider,
+      stateStore: mockStateStore as any,
+      userInteraction: { askUser: vi.fn() }
+    });
+
+    vi.mocked(mockLLMProvider.generateWithTools)
+      .mockResolvedValueOnce({
+        content: "",
+        toolCalls: [
+          { id: "1", type: "function", function: { name: "tool1", arguments: '{"input":"a"}' } },
+          { id: "2", type: "function", function: { name: "tool2", arguments: '{"input":"b"}' } }
+        ]
+      })
+      .mockResolvedValueOnce({ content: "Done", toolCalls: undefined });
+
+    const start = Date.now();
+    await runtime.run("test");
+    const duration = Date.now() - start;
+
+    // 并行执行应该 < 250ms (两个 100ms 并行)
+    expect(duration).toBeLessThan(250);
+    expect(toolResults.size).toBe(2);
+  });
+
+  it("should resume from saved state", async () => {
+    vi.mocked(mockStateStore.loadState).mockResolvedValue({
+      status: "thinking",
+      currentTask: "Pending task"
+    });
+    vi.mocked(mockStateStore.loadConversation).mockResolvedValue([
+      { role: "user", content: "Previous input" }
+    ]);
+
+    const resumed = await runtime.resume();
+    expect(resumed).toBe("Pending task");
+  });
+});
+```
+
+**Step 2: bash 工具测试**
+
+```typescript
+// tests/agent/tools/bash.test.ts
+import { describe, it, expect } from "vitest";
+import { createBashTool } from "../../../source/agent/tools/bash.js";
+
+describe("BashTool", () => {
+  const tool = createBashTool({ workingDirectory: process.cwd() });
+
+  it("should execute safe commands", async () => {
+    const result = await tool.execute({ command: "echo hello" });
+    expect(result.output).toBe("hello");
+    expect(result.error).toBeUndefined();
+  });
+
+  it("should block dangerous commands", async () => {
+    const result = await tool.execute({ command: "rm -rf /" });
+    expect(result.error).toContain("blocked");
+  });
+
+  it("should block git force push", async () => {
+    const result = await tool.execute({ command: "git push --force" });
+    expect(result.error).toContain("blocked");
+  });
+
+  it("should block npm run", async () => {
+    const result = await tool.execute({ command: "npm run build" });
+    expect(result.error).toContain("blocked");
+  });
+
+  it("should restrict to working directory", async () => {
+    const restrictedTool = createBashTool({
+      workingDirectory: "/tmp/test"
+    });
+    // 尝试路径穿越
+    const result = await restrictedTool.execute({ command: "cat ../../../etc/passwd" });
+    expect(result.error).toBeDefined();
+  });
+});
+```
+
+**Step 3: ask_user 工具测试**
+
+```typescript
+// tests/agent/tools/ask-user.test.ts
+import { describe, it, expect, vi } from "vitest";
+import { createAskUserTool } from "../../../source/agent/tools/ask-user.js";
+
+describe("AskUserTool", () => {
+  it("should save pending question to state store", async () => {
+    const savedState: any[] = [];
+    const mockStateStore = {
+      saveState: vi.fn(async (state: any) => {
+        savedState.push(state);
+      })
+    };
+
+    let resolveAsk: (answer: string) => void;
+    const mockUserInteraction = {
+      askUser: vi.fn(() => new Promise<string>(resolve => {
+        resolveAsk = resolve;
+      }))
+    };
+
+    const tool = createAskUserTool({
+      userInteraction: mockUserInteraction,
+      stateStore: mockStateStore as any,
+      onStateChange: vi.fn()
+    });
+
+    // 开始执行 (不等待)
+    const promise = tool.execute({ question: "Test question?" });
+
+    // 验证状态已保存
+    expect(mockStateStore.saveState).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "waiting_for_user",
+        pendingQuestion: { question: "Test question?" }
+      })
+    );
+  });
+});
+```
+
+**Step 4: Commit**
+
+```bash
+git add tests/agent/
+git commit -m "test(agent): add comprehensive tests for Runtime and tools"
 ```
 
 ---
