@@ -93,10 +93,16 @@ export interface Tool<TSchema extends ZodTypeAny = ZodTypeAny> {
   execute: (params: z.infer<TSchema>) => Promise<ToolResult>;
 }
 
-export interface ToolResult {
-  output: string;
-  error?: string;
-}
+export type ToolResult =
+  | {
+      kind: "completed";
+      output: string;
+      error?: string;
+    }
+  | {
+      kind: "await_user";
+      stateUpdate: Pick<AgentState, "status" | "pendingQuestion">;
+    };
 
 export interface AgentState {
   status: "idle" | "thinking" | "acting" | "waiting_for_user" | "completed" | "error";
@@ -334,10 +340,8 @@ git commit -m "feat(llm): add Function Calling support to LLMProvider"
 import { z, type ZodTypeAny } from "zod";
 import type {
   Tool,
-  ToolResult,
   AgentState,
-  FunctionDefinition,
-  UserInteraction
+  FunctionDefinition
 } from "./types.js";
 import type { Message, ToolCall } from "../types/index.js";
 import type { LLMProvider } from "../services/llm/types.js";
@@ -348,7 +352,7 @@ interface RuntimeConfig {
   tools: Tool[];
   llmProvider: LLMProvider;
   stateStore: StateStore;
-  userInteraction: UserInteraction;
+  onStateChange?: (state: AgentState) => void;
 }
 
 // 将 Zod Schema 转换为 JSON Schema
@@ -403,7 +407,7 @@ export class AgentRuntime {
   private tools: Map<string, Tool>;
   private llmProvider: LLMProvider;
   private stateStore: StateStore;
-  private userInteraction: UserInteraction;
+  private onStateChange?: (state: AgentState) => void;
   private systemPrompt: string;
   private abortController: AbortController | null = null;
 
@@ -412,7 +416,7 @@ export class AgentRuntime {
     this.tools = new Map(config.tools.map(t => [t.name, t]));
     this.llmProvider = config.llmProvider;
     this.stateStore = config.stateStore;
-    this.userInteraction = config.userInteraction;
+    this.onStateChange = config.onStateChange;
     this.state = { status: "idle" };
 
     // 添加 system prompt
@@ -497,17 +501,23 @@ export class AgentRuntime {
         await this.stateStore.saveConversation(this.messages);
 
         // 修复 P1: 并行执行工具,每个完成后立即保存结果 (支持 ask_user 中断恢复)
+        // ask_user 不再阻塞等待用户回答,而是返回 await_user 结果给 Runtime
         const askUserCall = response.toolCalls.find(tc => tc.function.name === "ask_user");
-        const pendingResults: Map<string, { toolCallId: string; output: string; error?: string }> = new Map();
+        const pendingResults: Map<string, {
+          toolCallId: string;
+        } & (
+          | { kind: "completed"; output: string; error?: string }
+          | { kind: "await_user"; stateUpdate: Pick<AgentState, "status" | "pendingQuestion"> }
+        )> = new Map();
 
         // 创建所有工具执行的 Promise,每个完成后立即保存结果
         const toolPromises = response.toolCalls.map(async (toolCall) => {
           const result = await this.executeToolCall(toolCall);
           pendingResults.set(toolCall.id, result);
 
-          // 关键修复: 非 ask_user 工具完成后立即保存结果到消息历史
-          // 这样即使 ask_user 阻塞导致程序中断,其他工具结果也不会丢失
-          if (toolCall.function.name !== "ask_user") {
+          // 非等待型工具完成后立即保存结果到消息历史
+          // 这样即使随后进入 waiting_for_user,已完成的工具结果也不会丢失
+          if (result.kind === "completed") {
             this.messages.push({
               role: "tool",
               content: result.error ? `Error: ${result.error}` : result.output,
@@ -520,32 +530,31 @@ export class AgentRuntime {
           return result;
         });
 
-        // 等待所有工具完成 (ask_user 会阻塞直到用户回答)
         await Promise.all(toolPromises);
 
-        // 检查是否在工具执行中进入了等待状态 (正常流程下 ask_user 已完成,这里不会触发)
-        // 但保留此检查以处理边界情况
-        if (this.state.status === "waiting_for_user") {
-          // 保存 ask_user 的 pendingToolCall
+        // ask_user 会返回 waiting 信号,Runtime 在这里停止主循环并等待 continueWithAnswer 接回
+        const askUserResult = askUserCall
+          ? pendingResults.get(askUserCall.id)
+          : undefined;
+        if (askUserCall && askUserResult?.kind === "await_user") {
           this.state = {
             ...this.state,
-            pendingToolCalls: askUserCall ? [askUserCall] : []
+            ...askUserResult.stateUpdate,
+            pendingToolCalls: [askUserCall]
           };
           await this.stateStore.saveState(this.state);
           await this.stateStore.saveConversation(this.messages);
+          this.onStateChange?.(this.state);
           break;
         }
 
-        // 添加 ask_user 的结果 (其他工具结果已在执行时添加)
-        if (askUserCall) {
-          const askUserResult = pendingResults.get(askUserCall.id);
-          if (askUserResult) {
+        // 添加 ask_user 的普通结果 (其他工具结果已在执行时添加)
+        if (askUserCall && askUserResult?.kind === "completed") {
             this.messages.push({
               role: "tool",
               content: askUserResult.error ? `Error: ${askUserResult.error}` : askUserResult.output,
-              toolCallId: askUserResult.id
+              toolCallId: askUserResult.toolCallId
             });
-          }
         }
 
         this.state = { status: "thinking" };
@@ -567,15 +576,17 @@ export class AgentRuntime {
   // 执行单个工具调用 (抽取为独立方法)
   private async executeToolCall(toolCall: ToolCall): Promise<{
     toolCallId: string;
-    output: string;
-    error?: string;
-  }> {
+  } & (
+    | { kind: "completed"; output: string; error?: string }
+    | { kind: "await_user"; stateUpdate: Pick<AgentState, "status" | "pendingQuestion"> }
+  )> {
     const toolName = toolCall.function.name;
     const tool = this.tools.get(toolName);
 
     if (!tool) {
       return {
         toolCallId: toolCall.id,
+        kind: "completed",
         output: "",
         error: `Unknown tool: ${toolName}`
       };
@@ -591,12 +602,12 @@ export class AgentRuntime {
 
       return {
         toolCallId: toolCall.id,
-        output: result.output,
-        error: result.error
+        ...result
       };
     } catch (error) {
       return {
         toolCallId: toolCall.id,
+        kind: "completed",
         output: "",
         error: error instanceof Error ? error.message : "Tool execution failed"
       };
@@ -606,9 +617,10 @@ export class AgentRuntime {
   // 并行执行工具 (保留用于其他场景)
   private async executeToolsInParallel(toolCalls: ToolCall[]): Promise<Array<{
     toolCallId: string;
-    output: string;
-    error?: string;
-  }>> {
+  } & (
+    | { kind: "completed"; output: string; error?: string }
+    | { kind: "await_user"; stateUpdate: Pick<AgentState, "status" | "pendingQuestion"> }
+  )>> {
     // 创建所有工具执行的 Promise
     const promises = toolCalls.map(async (toolCall) => {
       const toolName = toolCall.function.name;
@@ -617,6 +629,7 @@ export class AgentRuntime {
       if (!tool) {
         return {
           toolCallId: toolCall.id,
+          kind: "completed",
           output: "",
           error: `Unknown tool: ${toolName}`
         };
@@ -632,12 +645,12 @@ export class AgentRuntime {
 
         return {
           toolCallId: toolCall.id,
-          output: result.output,
-          error: result.error
+          ...result
         };
       } catch (error) {
         return {
           toolCallId: toolCall.id,
+          kind: "completed",
           output: "",
           error: error instanceof Error ? error.message : "Tool execution failed"
         };
@@ -863,6 +876,7 @@ Working directory is restricted to the project folder.`,
       for (const pattern of DANGEROUS_PATTERNS) {
         if (pattern.test(command)) {
           return {
+            kind: "completed",
             output: "",
             error: `Command blocked: contains dangerous pattern`
           };
@@ -873,6 +887,7 @@ Working directory is restricted to the project folder.`,
       const commandName = command.trim().split(/\s+/)[0];
       if (!allowedCommands.includes(commandName)) {
         return {
+          kind: "completed",
           output: "",
           error: `Command not allowed: ${commandName}. Allowed commands: ${allowedCommands.join(", ")}`
         };
@@ -881,6 +896,7 @@ Working directory is restricted to the project folder.`,
       // 安全检查 3: 防止路径穿越
       if (command.includes("..") || command.includes("~")) {
         return {
+          kind: "completed",
           output: "",
           error: `Command blocked: path traversal detected`
         };
@@ -894,16 +910,16 @@ Working directory is restricted to the project folder.`,
         });
 
         const output = stderr ? `${stdout}\n${stderr}` : stdout;
-        return { output: output.trim() };
+        return { kind: "completed", output: output.trim() };
       } catch (error) {
         if (error instanceof Error) {
           // 超时错误
           if (error.message.includes("ETIMEDOUT")) {
-            return { output: "", error: `Command timed out after ${timeout}ms` };
+            return { kind: "completed", output: "", error: `Command timed out after ${timeout}ms` };
           }
-          return { output: "", error: error.message };
+          return { kind: "completed", output: "", error: error.message };
         }
-        return { output: "", error: "Unknown error executing bash command" };
+        return { kind: "completed", output: "", error: "Unknown error executing bash command" };
       }
     }
   };
@@ -977,9 +993,10 @@ export function createGenerateContentTool(config: GenerateContentToolConfig): To
           fullContent += chunk;
         }
 
-        return { output: fullContent };
+        return { kind: "completed", output: fullContent };
       } catch (error) {
         return {
+          kind: "completed",
           output: "",
           error: error instanceof Error ? error.message : "Unknown error"
         };
@@ -1028,7 +1045,7 @@ git commit -m "feat(agent): add generate_content tool implementation"
 ```typescript
 // source/agent/tools/ask-user.ts
 import { z } from "zod";
-import type { Tool, ToolResult, UserInteraction, AgentState } from "../types.js";
+import type { Tool, ToolResult, AgentState } from "../types.js";
 import type { StateStore } from "../state-store.js";
 
 const AskUserSchema = z.object({
@@ -1036,11 +1053,10 @@ const AskUserSchema = z.object({
   options: z.array(z.string()).optional().describe("Optional predefined options")
 });
 
-// 修复 P5: 添加 StateStore 参数实现持久化
+// 修复 P5: ask_user 改为返回 waiting 信号,由 Runtime 统一暂停主循环
 interface AskUserToolConfig {
-  userInteraction: UserInteraction;
   stateStore: StateStore;
-  onStateChange: (state: Partial<AgentState>) => void;
+  getState: () => AgentState;
 }
 
 export function createAskUserTool(config: AskUserToolConfig): Tool {
@@ -1050,8 +1066,9 @@ export function createAskUserTool(config: AskUserToolConfig): Tool {
     parameters: AskUserSchema,
     execute: async (params: z.infer<typeof AskUserSchema>): Promise<ToolResult> => {
       try {
-        // 修复 P5: 在等待用户前持久化状态
+        // 保留 Runtime 先前写入的 pendingToolCalls,避免恢复时丢失 ask_user 原始调用
         const waitingState: AgentState = {
+          ...config.getState(),
           status: "waiting_for_user",
           pendingQuestion: {
             question: params.question,
@@ -1059,31 +1076,20 @@ export function createAskUserTool(config: AskUserToolConfig): Tool {
           }
         };
 
-        // 通知状态变更
-        config.onStateChange(waitingState);
-
         // 持久化等待状态 (支持断点恢复)
         await config.stateStore.saveState(waitingState);
 
-        // 等待用户回答
-        const answer = await config.userInteraction.askUser(
-          params.question,
-          params.options
-        );
-
-        // 清除等待状态
-        const completedState: AgentState = {
-          status: "thinking",
-          pendingQuestion: undefined
-        };
-        config.onStateChange(completedState);
-        await config.stateStore.saveState(completedState);
-
-        return { output: answer };
-      } catch (error) {
-        // 错误时也要清除等待状态
-        config.onStateChange({ status: "error", pendingQuestion: undefined });
+        // 立即返回 waiting 信号,由 Runtime 停止主循环并等待 continueWithAnswer 接回
         return {
+          kind: "await_user",
+          stateUpdate: {
+            status: "waiting_for_user",
+            pendingQuestion: waitingState.pendingQuestion
+          }
+        };
+      } catch (error) {
+        return {
+          kind: "completed",
           output: "",
           error: error instanceof Error ? error.message : "Unknown error"
         };
@@ -1148,12 +1154,13 @@ Note: Multiple dispatch_agent calls in the same response will execute in paralle
         const result = await config.subAgentRunner(subAgentConfig);
 
         if (result.success) {
-          return { output: result.output };
+          return { kind: "completed", output: result.output };
         } else {
-          return { output: "", error: result.error ?? "SubAgent failed" };
+          return { kind: "completed", output: "", error: result.error ?? "SubAgent failed" };
         }
       } catch (error) {
         return {
+          kind: "completed",
           output: "",
           error: error instanceof Error ? error.message : "Unknown error"
         };
@@ -1181,7 +1188,7 @@ git commit -m "feat(agent): add dispatch_agent tool for SubAgent dispatching"
 
 ```typescript
 // source/agent/tools/index.ts
-import type { Tool, UserInteraction, SubAgentConfig, SubAgentResult, AgentState } from "../types.js";
+import type { Tool, SubAgentConfig, SubAgentResult, AgentState } from "../types.js";
 import type { LLMProvider } from "../../services/llm/types.js";
 import type { StateStore } from "../state-store.js";
 import { createBashTool } from "./bash.js";
@@ -1191,12 +1198,11 @@ import { createDispatchAgentTool } from "./dispatch-agent.js";
 
 export interface CreateToolsConfig {
   llmProvider: LLMProvider;
-  userInteraction: UserInteraction;
   subAgentRunner: (config: SubAgentConfig) => Promise<SubAgentResult>;
   workingDirectory: string;
   // 修复 P7: ask_user 需要的额外参数
   stateStore: StateStore;
-  onStateChange: (state: Partial<AgentState>) => void;
+  getState: () => AgentState;
 }
 
 export function createCoreTools(config: CreateToolsConfig): Tool[] {
@@ -1205,9 +1211,8 @@ export function createCoreTools(config: CreateToolsConfig): Tool[] {
     createGenerateContentTool({ llmProvider: config.llmProvider }),
     // 修复 P7: 传入完整参数
     createAskUserTool({
-      userInteraction: config.userInteraction,
       stateStore: config.stateStore,
-      onStateChange: config.onStateChange
+      getState: config.getState
     }),
     createDispatchAgentTool({ subAgentRunner: config.subAgentRunner })
   ];
@@ -1779,14 +1784,13 @@ export function AgentView({
 
 ```typescript
 // source/app.tsx (关键修改)
-import React, { useCallback, useEffect, useState, useRef } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { AgentView } from "./components/AgentView.js";
 import { AgentRuntime } from "./agent/runtime.js";
 import { createCoreTools } from "./agent/tools/index.js";
 import { createSubAgentRunner } from "./agent/subagents/index.js";
 import { StateStore } from "./agent/state-store.js";
 import { AGENT_SYSTEM_PROMPT } from "./agent/prompt.js";
-import type { UserInteraction } from "./agent/types.js";
 
 // ... 其他导入 ...
 
@@ -1797,11 +1801,9 @@ export default function App() {
   const [pendingQuestion, setPendingQuestion] = useState<{
     question: string;
     options?: string[];
-    resolve: (answer: string) => void;
   } | null>(null);
 
   const [runtime, setRuntime] = useState<AgentRuntime | null>(null);
-  const questionResolveRef = useRef<((answer: string) => void) | null>(null);
 
   // 初始化 Agent (修复 P6: 对齐真实 API)
   const initializeAgent = useCallback((project: NovelProject, paths: ProjectPaths) => {
@@ -1818,16 +1820,6 @@ export default function App() {
     // 修复 P1: 使用项目目录而非工作区根目录,避免多项目状态串线
     const stateStore = new StateStore({ projectPath: paths.projectDir });
 
-    // 修复 P2: 实现用户交互回调
-    const userInteraction: UserInteraction = {
-      askUser: async (question: string, options?: string[]) => {
-        return new Promise((resolve) => {
-          questionResolveRef.current = resolve;
-          setPendingQuestion({ question, options, resolve });
-        });
-      }
-    };
-
     // 修复 P8: 传入正确的路径参数
     // 修复 P1: 使用 project.slug 而非 currentProject.slug
     const subAgentRunner = createSubAgentRunner({
@@ -1836,30 +1828,31 @@ export default function App() {
       projectSlug: project.slug          // 项目 slug (使用参数,非 state)
     });
 
+    let agentRuntime!: AgentRuntime;
+
     // 修复 P2: 传入完整参数
     const tools = createCoreTools({
       llmProvider,
-      userInteraction,
       subAgentRunner,
       workingDirectory: paths.rootDir,
+      stateStore,
+      getState: () => agentRuntime.getState()
+    });
+
+    agentRuntime = new AgentRuntime({
+      systemPrompt: AGENT_SYSTEM_PROMPT,
+      tools,
+      llmProvider,
       stateStore,
       onStateChange: (state) => {
         if (state.status === "waiting_for_user" && state.pendingQuestion) {
           setPendingQuestion({
             question: state.pendingQuestion.question,
-            options: state.pendingQuestion.options,
-            resolve: () => {} // placeholder, 实际由 ask_user 设置
+            options: state.pendingQuestion.options
           });
+          setAgentOutput(`等待您的回答: ${state.pendingQuestion.question}`);
         }
       }
-    });
-
-    const agentRuntime = new AgentRuntime({
-      systemPrompt: AGENT_SYSTEM_PROMPT,
-      tools,
-      llmProvider,
-      stateStore,
-      userInteraction
     });
 
     setRuntime(agentRuntime);
@@ -1874,28 +1867,9 @@ export default function App() {
       if (resumedState) {
         // 修复 P1: 如果有待恢复的问题,恢复问答 UI 并使用 continueWithAnswer 接回原工具调用
         if (resumedState.status === "waiting_for_user" && resumedState.pendingQuestion) {
-          // 创建新的 Promise 和 resolve
-          const answerPromise = new Promise<string>((resolve) => {
-            questionResolveRef.current = resolve;
-          });
-
           setPendingQuestion({
             question: resumedState.pendingQuestion.question,
-            options: resumedState.pendingQuestion.options,
-            resolve: (answer: string) => {
-              if (questionResolveRef.current) {
-                questionResolveRef.current(answer);
-              }
-            }
-          });
-
-          // 用户回答后使用 continueWithAnswer 接回原工具调用 (修复 P1)
-          answerPromise.then((answer) => {
-            setIsThinking(true);
-            runtime.continueWithAnswer(answer)
-              .then(setAgentOutput)
-              .catch(console.error)
-              .finally(() => setIsThinking(false));
+            options: resumedState.pendingQuestion.options
           });
 
           setAgentOutput(`等待您的回答: ${resumedState.pendingQuestion.question}`);
@@ -1910,13 +1884,21 @@ export default function App() {
   }, [runtime]);
 
   // 处理用户回答 (修复 P2)
-  const handleAnswerQuestion = useCallback((answer: string) => {
-    if (pendingQuestion?.resolve) {
-      pendingQuestion.resolve(answer);
-    }
+  const handleAnswerQuestion = useCallback(async (answer: string) => {
+    if (!runtime) return;
+
     setPendingQuestion(null);
-    questionResolveRef.current = null;
-  }, [pendingQuestion]);
+    setIsThinking(true);
+
+    try {
+      const result = await runtime.continueWithAnswer(answer);
+      setAgentOutput(result);
+    } catch (error) {
+      setAgentOutput(error instanceof Error ? error.message : "继续执行失败");
+    } finally {
+      setIsThinking(false);
+    }
+  }, [runtime]);
 
   // 处理用户输入
   const handleAgentSubmit = useCallback(async (input: string) => {
@@ -2028,8 +2010,7 @@ describe("AgentRuntime", () => {
       systemPrompt: "Test prompt",
       tools: [],
       llmProvider: mockLLMProvider,
-      stateStore: mockStateStore as any,
-      userInteraction: { askUser: vi.fn() }
+      stateStore: mockStateStore as any
     });
   });
 
@@ -2058,7 +2039,7 @@ describe("AgentRuntime", () => {
       execute: async (params) => {
         await new Promise(r => setTimeout(r, 100));
         toolResults.set("tool1", params.input);
-        return { output: "tool1 result" };
+        return { kind: "completed", output: "tool1 result" };
       }
     };
 
@@ -2069,7 +2050,7 @@ describe("AgentRuntime", () => {
       execute: async (params) => {
         await new Promise(r => setTimeout(r, 100));
         toolResults.set("tool2", params.input);
-        return { output: "tool2 result" };
+        return { kind: "completed", output: "tool2 result" };
       }
     };
 
@@ -2077,8 +2058,7 @@ describe("AgentRuntime", () => {
       systemPrompt: "Test",
       tools: [mockTool1, mockTool2],
       llmProvider: mockLLMProvider,
-      stateStore: mockStateStore as any,
-      userInteraction: { askUser: vi.fn() }
+      stateStore: mockStateStore as any
     });
 
     vi.mocked(mockLLMProvider.generateWithTools)
@@ -2119,6 +2099,9 @@ describe("AgentRuntime", () => {
   it("should resume pending question state", async () => {
     vi.mocked(mockStateStore.loadState).mockResolvedValue({
       status: "waiting_for_user",
+      pendingToolCalls: [
+        { id: "1", type: "function", function: { name: "ask_user", arguments: '{"question":"Which character?"}' } }
+      ],
       pendingQuestion: {
         question: "Which character should be the focus?",
         options: ["Alice", "Bob"]
@@ -2131,6 +2114,7 @@ describe("AgentRuntime", () => {
 
     const resumed = await runtime.resume();
     expect(resumed?.status).toBe("waiting_for_user");
+    expect(resumed?.pendingToolCalls?.[0]?.function.name).toBe("ask_user");
     expect(resumed?.pendingQuestion?.question).toBe("Which character should be the focus?");
     expect(resumed?.pendingQuestion?.options).toEqual(["Alice", "Bob"]);
   });
@@ -2187,7 +2171,7 @@ import { describe, it, expect, vi } from "vitest";
 import { createAskUserTool } from "../../../source/agent/tools/ask-user.js";
 
 describe("AskUserTool", () => {
-  it("should save pending question to state store", async () => {
+  it("should save pending question with pendingToolCalls intact", async () => {
     const savedState: any[] = [];
     const mockStateStore = {
       saveState: vi.fn(async (state: any) => {
@@ -2195,27 +2179,26 @@ describe("AskUserTool", () => {
       })
     };
 
-    let resolveAsk: (answer: string) => void;
-    const mockUserInteraction = {
-      askUser: vi.fn(() => new Promise<string>(resolve => {
-        resolveAsk = resolve;
-      }))
-    };
-
     const tool = createAskUserTool({
-      userInteraction: mockUserInteraction,
       stateStore: mockStateStore as any,
-      onStateChange: vi.fn()
+      getState: () => ({
+        status: "acting",
+        pendingToolCalls: [
+          { id: "1", type: "function", function: { name: "ask_user", arguments: "{\"question\":\"Test question?\"}" } }
+        ]
+      })
     });
 
-    // 开始执行 (不等待)
-    const promise = tool.execute({ question: "Test question?" });
+    const result = await tool.execute({ question: "Test question?" });
 
-    // 验证状态已保存
+    expect(result.kind).toBe("await_user");
     expect(mockStateStore.saveState).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "waiting_for_user",
-        pendingQuestion: { question: "Test question?" }
+        pendingQuestion: { question: "Test question?" },
+        pendingToolCalls: [
+          { id: "1", type: "function", function: { name: "ask_user", arguments: "{\"question\":\"Test question?\"}" } }
+        ]
       })
     );
   });
