@@ -1249,17 +1249,16 @@ import type { AgentState, ConversationMessage } from "./types.js";
 
 interface StateStoreConfig {
   projectPath: string;
-  conversationDir?: string;
+  storageDir?: string;
 }
 
 export class StateStore {
-  private projectPath: string;
-  private conversationDir: string;
+  private storageDir: string;
 
   constructor(config: StateStoreConfig) {
-    this.projectPath = config.projectPath;
-    this.conversationDir = config.conversationDir
-      ?? path.join(process.env.HOME ?? "", ".novel-agent", "conversations");
+    // 状态和会话统一放到项目内 .agent 目录,避免恢复时跨目录漂移
+    this.storageDir = config.storageDir
+      ?? path.join(config.projectPath, ".agent");
   }
 
   async saveState(state: AgentState): Promise<void> {
@@ -1279,16 +1278,14 @@ export class StateStore {
   }
 
   async saveConversation(messages: ConversationMessage[]): Promise<void> {
-    const projectSlug = path.basename(this.projectPath);
-    const conversationPath = this.getConversationPath(projectSlug);
+    const conversationPath = this.getConversationPath();
     await fs.mkdir(path.dirname(conversationPath), { recursive: true });
     await fs.writeFile(conversationPath, JSON.stringify(messages, null, 2), "utf-8");
   }
 
   async loadConversation(): Promise<ConversationMessage[] | null> {
     try {
-      const projectSlug = path.basename(this.projectPath);
-      const conversationPath = this.getConversationPath(projectSlug);
+      const conversationPath = this.getConversationPath();
       const content = await fs.readFile(conversationPath, "utf-8");
       return JSON.parse(content) as ConversationMessage[];
     } catch {
@@ -1310,11 +1307,11 @@ export class StateStore {
   }
 
   private getStatePath(): string {
-    return path.join(this.projectPath, ".agent-state.json");
+    return path.join(this.storageDir, "state.json");
   }
 
-  private getConversationPath(projectSlug: string): string {
-    return path.join(this.conversationDir, projectSlug, "history.json");
+  private getConversationPath(): string {
+    return path.join(this.storageDir, "history.json");
   }
 }
 ```
@@ -2117,6 +2114,41 @@ describe("AgentRuntime", () => {
     expect(resumed?.pendingToolCalls?.[0]?.function.name).toBe("ask_user");
     expect(resumed?.pendingQuestion?.question).toBe("Which character should be the focus?");
     expect(resumed?.pendingQuestion?.options).toEqual(["Alice", "Bob"]);
+  });
+
+  it("should continue with user answer and resume the run loop", async () => {
+    vi.mocked(mockStateStore.loadState).mockResolvedValue({
+      status: "waiting_for_user",
+      pendingToolCalls: [
+        { id: "ask-1", type: "function", function: { name: "ask_user", arguments: '{"question":"Which character?"}' } }
+      ],
+      pendingQuestion: {
+        question: "Which character should be the focus?"
+      }
+    });
+    vi.mocked(mockStateStore.loadConversation).mockResolvedValue([
+      { role: "user", content: "Write chapter 1" },
+      { role: "assistant", content: "", toolCalls: [{ id: "ask-1", type: "function", function: { name: "ask_user", arguments: '{"question":"Which character?"}' } }] }
+    ]);
+    vi.mocked(mockLLMProvider.generateWithTools).mockResolvedValue({
+      content: "Continuing with Alice",
+      toolCalls: undefined
+    });
+
+    await runtime.resume();
+    const result = await runtime.continueWithAnswer("Alice");
+
+    expect(result).toBe("Continuing with Alice");
+    expect(mockStateStore.saveConversation).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "tool",
+          content: "Alice",
+          toolCallId: "ask-1"
+        })
+      ])
+    );
+    expect(runtime.getState().status).toBe("completed");
   });
 });
 ```
