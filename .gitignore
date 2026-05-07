@@ -7,7 +7,9 @@ projects/
 
 .DS_Store
 
-docs
+docs/*
+!docs/plans/
+!docs/plans/**
 tests/*
 !tests/e2e/
 !tests/e2e/**
